@@ -47,10 +47,13 @@ export type VarMap = Record<string, string>;
 export class AcondError extends Error {}
 export class AuthError extends AcondError {}
 
+const TIMEOUT_MS = 8000;
+
 export class AcondClient {
   private cfg: Config;
   private base: string;
   private nonceCookie: string;
+  private loginInFlight: Promise<void> | null = null;
 
   constructor(cfg: Config) {
     this.cfg = { deviceUser: "acond", devicePassword: "acond", ...cfg };
@@ -69,15 +72,59 @@ export class AcondClient {
     return jar?.[name]?.value ?? null;
   }
 
-  /** SHA1 challenge-response handshake. Establishes the session cookie. */
-  async login(): Promise<void> {
+  /**
+   * fetch wrapper with a hard timeout. Returns status, the raw bytes, and the
+   * Location header. Never follows-vs-not is irrelevant to callers — they detect
+   * auth state from the body (see isLoginPage), so RN's unreliable
+   * `redirect: "manual"` handling can't cause a false positive.
+   */
+  private async request(
+    path: string,
+    opts: { method?: "GET" | "POST"; body?: string } = {}
+  ): Promise<{ status: number; bytes: Uint8Array; location: string }> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const headers: Record<string, string> = {
+        Authorization: this.basic(),
+        "x-tecomat": "data",
+      };
+      if (opts.body != null) headers["Content-Type"] = "application/x-www-form-urlencoded";
+      const res = await fetch(this.base + path, {
+        method: opts.method ?? "GET",
+        headers,
+        body: opts.body,
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      return { status: res.status, bytes, location: res.headers.get("location") ?? "" };
+    } catch (e) {
+      if (e instanceof Error && e.name === "AbortError") {
+        throw new AcondError(`Request timed out after ${TIMEOUT_MS}ms`);
+      }
+      throw new AcondError(`Network error: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** SHA1 challenge-response handshake. De-duped so concurrent callers share one. */
+  login(): Promise<void> {
+    if (!this.loginInFlight) {
+      this.loginInFlight = this.doLogin().finally(() => {
+        this.loginInFlight = null;
+      });
+    }
+    return this.loginInFlight;
+  }
+
+  private async doLogin(): Promise<void> {
     await CookieManager.clearAll();
 
     // 1) prime a fresh nonce cookie
     const primePath = this.cfg.mode === "remote" ? "/" : "/SYSWWW/LOGIN.XML";
-    await fetch(this.base + primePath, {
-      headers: { Authorization: this.basic() },
-    });
+    await this.request(primePath);
     const nonce = await this.readCookie(this.nonceCookie);
     if (!nonce) throw new AcondError("No nonce cookie from server");
 
@@ -99,62 +146,54 @@ export class AcondClient {
         ? form({ USER: user, PASS: pass, PLC: this.cfg.plc })
         : form({ USER: user, PASS: pass });
 
-    const res = await fetch(this.base + loginPath, {
-      method: "POST",
-      headers: {
-        Authorization: this.basic(),
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body,
-      redirect: "manual",
-    });
+    const res = await this.request(loginPath, { method: "POST", body });
+    const text = decodeCp1250(res.bytes);
 
-    // TecoRoute answers 200 with <ACER VALUE="1"/> on a bad login; the PLC
-    // redirects back to LOGIN.XML. Detect both.
+    // Bad credentials — detected from the body (redirect-behavior agnostic):
+    //   remote: TecoRoute answers <ACER VALUE="1"/>
+    //   LAN:    the controller re-serves the login page (or 302 → LOGIN.XML)
     if (this.cfg.mode === "remote") {
-      const text = await res.text();
       if (/ACER\s+VALUE="1"/.test(text)) {
         throw new AuthError("Wrong TecoRoute login, password, or PLC name");
       }
-    } else {
-      const loc = res.headers.get("location") ?? "";
-      if (/LOGIN\.XML/i.test(loc)) throw new AuthError("Wrong device password");
+    } else if (/LOGIN\.XML/i.test(res.location) || isLoginPage(text)) {
+      throw new AuthError("Wrong device password");
     }
   }
 
   /** GET a page → parsed { NAME: VALUE } map, re-logging in once on expiry. */
   async readPage(page: string, retry = true): Promise<VarMap> {
-    const res = await fetch(this.base + page, {
-      headers: { Authorization: this.basic(), "x-tecomat": "data" },
-      redirect: "manual",
-    });
-    if (res.status === 301 || res.status === 302 || res.status === 401) {
-      if (!retry) throw new AuthError("Session expired");
+    const res = await this.request(page);
+    const text = decodeCp1250(res.bytes);
+    const expired =
+      res.status === 301 || res.status === 302 || res.status === 401 || isLoginPage(text);
+    if (expired) {
+      if (!retry) throw new AuthError("Session expired and re-login did not help");
       await this.login();
       return this.readPage(page, false);
     }
-    if (!res.ok) throw new AcondError(`GET ${page} → HTTP ${res.status}`);
-    const buf = new Uint8Array(await res.arrayBuffer());
-    return parseXml(buf);
+    if (res.status < 200 || res.status >= 300) {
+      throw new AcondError(`GET ${page} → HTTP ${res.status}`);
+    }
+    return parseXml(res.bytes);
   }
 
   /** Write one setpoint (absolute REAL value). */
   async writeVar(name: string, value: string | number, page: string, retry = true): Promise<void> {
-    const res = await fetch(this.base + page, {
-      method: "POST",
-      headers: {
-        Authorization: this.basic(),
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: form({ [name]: String(value) }),
-      redirect: "manual",
-    });
-    if (res.status === 301 || res.status === 302 || res.status === 401) {
+    const res = await this.request(page, { method: "POST", body: form({ [name]: String(value) }) });
+    const expired =
+      res.status === 301 ||
+      res.status === 302 ||
+      res.status === 401 ||
+      isLoginPage(decodeCp1250(res.bytes));
+    if (expired) {
       if (!retry) throw new AuthError("Session expired during write");
       await this.login();
       return this.writeVar(name, value, page, false);
     }
-    if (!res.ok) throw new AcondError(`POST ${page} (${name}) → HTTP ${res.status}`);
+    if (res.status < 200 || res.status >= 300) {
+      throw new AcondError(`POST ${page} (${name}) → HTTP ${res.status}`);
+    }
   }
 
   /**
@@ -186,6 +225,15 @@ export class AcondClient {
 // --------------------------------------------------------------------------
 // helpers
 // --------------------------------------------------------------------------
+
+/**
+ * True if a response body is the controller's / TecoRoute's login page rather
+ * than data — the reliable signal that the session expired or credentials are
+ * wrong, independent of how RN handled the 302.
+ */
+function isLoginPage(text: string): boolean {
+  return /LOGIN\.XSL|TR_LOGIN|<LOGIN\b|name="PASS"/i.test(text);
+}
 
 function form(obj: Record<string, string>): string {
   return Object.entries(obj)

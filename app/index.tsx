@@ -112,6 +112,7 @@ export default function Onboarding() {
       <KeyboardAvoidingView behavior="padding" style={{ flex: 1 }}>
         <ScrollView
           contentInsetAdjustmentBehavior="automatic"
+          automaticallyAdjustKeyboardInsets
           keyboardShouldPersistTaps="handled"
           keyboardDismissMode="interactive"
           contentContainerStyle={{ padding: 24, paddingTop: 80, paddingBottom: 24, gap: 24, flexGrow: 1 }}
@@ -308,7 +309,7 @@ function ChoiceCard({
             <Text style={{ fontSize: 20, fontWeight: "600", color: colors.label }}>{title}</Text>
             <Text style={{ fontSize: 15, lineHeight: 21, color: colors.secondaryLabel }}>{text}</Text>
           </View>
-          <SymbolView name="chevron.right" tintColor={ink.secondary} size={16} weight="semibold" />
+          <SymbolView name="chevron.right" tintColor={colors.secondaryLabel} size={16} weight="semibold" />
         </View>
       </AdaptiveGlass>
     </Pressable>

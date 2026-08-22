@@ -69,7 +69,7 @@ function Row({
       }}
     >
       {icon ? (
-        <SymbolView name={icon} tintColor={ink.secondary} size={20} weight="regular" />
+        <SymbolView name={icon} tintColor={colors.secondaryLabel} size={20} weight="regular" />
       ) : null}
       <Text style={{ color: colors.secondaryLabel, fontSize: 16 }}>{label}</Text>
       <Text
@@ -114,7 +114,7 @@ function InfoRow({
       {icon ? (
         <SymbolView
           name={icon}
-          tintColor={ink.secondary}
+          tintColor={colors.secondaryLabel}
           size={20}
           weight="regular"
           style={{ marginTop: 2 }}
@@ -205,7 +205,7 @@ export default function SettingsScreen() {
               if (process.env.EXPO_OS === "ios") {
                 Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
               }
-              Alert.alert("Nepovedlo se", "Režim se nepodařilo přepnout. Zkus to znovu.");
+              Alert.alert("Nepovedlo se", "Režim se nepodařilo přepnout. Zkuste to znovu.");
             } finally {
               setBusy(false);
             }
@@ -216,7 +216,7 @@ export default function SettingsScreen() {
   }
 
   function onSignOut() {
-    Alert.alert("Odhlásit se?", "Budeš se muset příště znovu přihlásit.", [
+    Alert.alert("Odhlásit se?", "Budete se muset příště znovu přihlásit.", [
       { text: "Zrušit", style: "cancel" },
       {
         text: "Odhlásit",

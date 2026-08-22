@@ -60,17 +60,25 @@ export async function initHistory(): Promise<void> {
 
 /**
  * Records one sample. Safe to call on every poll: rows are keyed to a 5-minute
- * time bucket, so INSERT OR IGNORE keeps only the first sample per bucket. Null
- * fields are stored as NULL and skipped by every reader. Never throws.
+ * time bucket. On a repeated bucket we COALESCE — a later poll fills in any
+ * field that was null on the first poll (e.g. heat output flagged invalid at
+ * first), without overwriting an already-captured value with a null. Never throws.
  */
 export async function recordSample(s: Snapshot): Promise<void> {
   try {
     const handle = await db();
     const bucket = Math.floor(Date.now() / BUCKET_MS) * BUCKET_MS;
     await handle.runAsync(
-      `INSERT OR IGNORE INTO samples
+      `INSERT INTO samples
          (ts, roomTemp, dhwTemp, outdoor, heatKw, roomTarget, dhwTarget)
-       VALUES (?, ?, ?, ?, ?, ?, ?);`,
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(ts) DO UPDATE SET
+         roomTemp   = COALESCE(samples.roomTemp,   excluded.roomTemp),
+         dhwTemp    = COALESCE(samples.dhwTemp,    excluded.dhwTemp),
+         outdoor    = COALESCE(samples.outdoor,    excluded.outdoor),
+         heatKw     = COALESCE(samples.heatKw,     excluded.heatKw),
+         roomTarget = COALESCE(samples.roomTarget, excluded.roomTarget),
+         dhwTarget  = COALESCE(samples.dhwTarget,  excluded.dhwTarget);`,
       bucket,
       s.roomTemp,
       s.dhwTemp,

@@ -27,7 +27,10 @@ export default function Home() {
   const [lastOk, setLastOk] = useState<number | null>(null);
   const [errorSince, setErrorSince] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
-  const writeLock = useRef(false);
+  // Per-setpoint write queue: the latest requested value always wins, and no tap
+  // is dropped even if a previous write is still in flight.
+  const latestWrite = useRef<{ room: number | null; dhw: number | null }>({ room: null, dhw: null });
+  const draining = useRef<{ room: boolean; dhw: boolean }>({ room: false, dhw: false });
 
   useEffect(() => {
     initHistory();
@@ -87,20 +90,28 @@ export default function Home() {
     varName: string,
     page: string
   ) {
-    if (!client || writeLock.current) return;
-    writeLock.current = true;
-    (kind === "room" ? setRoomPending : setDhwPending)(value);
+    if (!client) return;
+    const setPending = kind === "room" ? setRoomPending : setDhwPending;
+    setPending(value);
+    latestWrite.current[kind] = value; // newest request wins
+    if (draining.current[kind]) return; // an in-flight drain will pick it up
+    draining.current[kind] = true;
     try {
-      await client.writeVar(varName, value.toFixed(1), page);
+      while (latestWrite.current[kind] != null) {
+        const v = latestWrite.current[kind]!;
+        latestWrite.current[kind] = null;
+        await client.writeVar(varName, v.toFixed(1), page);
+      }
       setTimeout(() => refresh(true), 600); // confirm from the device
     } catch {
       if (process.env.EXPO_OS === "ios") {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       }
-      (kind === "room" ? setRoomPending : setDhwPending)(null);
-      Alert.alert("Nepovedlo se", "Změnu se nepodařilo uložit. Zkus to prosím znovu.");
+      latestWrite.current[kind] = null;
+      setPending(null);
+      Alert.alert("Nepovedlo se", "Změnu se nepodařilo uložit. Zkuste to prosím znovu.");
     } finally {
-      writeLock.current = false;
+      draining.current[kind] = false;
     }
   }
 
