@@ -19,7 +19,8 @@ ACOND owners who wanted an app that's actually pleasant to use every day.
 - 💧 **Hot water** — read the tank temperature and set the target.
 - 📊 **Live dashboard** — outdoor temperature (current + 24 h average), flow temperature, live thermal output in kW, and what the pump is doing right now (heating, heating water, defrosting, or resting).
 - 📈 **History & trends** — the app quietly logs readings **on your device** and draws clean 24 h / 7 day / 30 day charts you can drag your finger across to read any point.
-- ☀️❄️ **Season switch** — flip between summer and winter mode (with a clear confirmation, because it starts or stops your heating).
+- ☀️❄️ **Season switch** — flip between summer and winter mode the way the panel does it (its own confirm dialog), with a clear confirmation that also tells you how the controller's "end of heating season" threshold will change.
+- ⏻ **Heating on / off** — switch between automatic mode (AUT) and off (VYP), behind a confirmation.
 - 🌗 **Light / dark / automatic** appearance, native iOS design, Liquid Glass, haptics.
 - 🔌 **Connection indicator** — always know whether you're really talking to the pump.
 
@@ -54,11 +55,16 @@ endpoints the official web panel already exposes on your network.
 ## Safety
 
 This app controls real heating equipment in a real home. By design it only writes
-the two settings that are safe to change and have been round‑trip tested:
+settings that have been round‑trip tested against a live controller, and it reads
+every change back to confirm the controller accepted it:
 
 - **Room target temperature**
 - **Hot‑water target temperature**
-- **Summer/Winter season** (behind an explicit confirmation)
+- **Summer/Winter season** (behind an explicit confirmation). A manual switch makes
+  the controller reset its "end of heating season" threshold to the current outdoor
+  average ± 3 °C — the confirmation shows the old and new value.
+- **Heating on / off** — AUT (automatic) or VYP ("heating system off"), behind an
+  explicit confirmation. Whether hot water keeps heating in VYP is not yet verified.
 
 It deliberately does **not** expose the enable bits, service pages, or network
 configuration that could leave a house cold or misconfigured.

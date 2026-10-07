@@ -61,6 +61,8 @@ export function Stepper({
     }, 500);
   };
 
+  const shown = local.toFixed(step < 1 ? 1 : 0);
+
   return (
     <View
       style={{
@@ -74,9 +76,12 @@ export function Stepper({
       {/* The setpoint number is the single focal point — large and light. */}
       <View style={{ flex: 1, alignItems: "center" }}>
         <Text
-          selectable
+          // "22.5" must never wrap to "22." / "5": at 72 pt four characters are
+          // wider than the space between the buttons on a 402 pt phone, and
+          // adjustsFontSizeToFit does not shrink it reliably. Size by length.
+          numberOfLines={1}
           style={{
-            fontSize: 72,
+            fontSize: shown.length > 3 ? 60 : 72,
             lineHeight: 76,
             fontWeight: "300",
             color: busy ? colors.secondaryLabel : colors.label,
@@ -84,7 +89,7 @@ export function Stepper({
             letterSpacing: -1.5,
           }}
         >
-          {local.toFixed(step < 1 ? 1 : 0)}
+          {shown}
         </Text>
         <Text style={{ fontSize: 14, color: colors.secondaryLabel, marginTop: 2, letterSpacing: 0.2 }}>
           {unit}

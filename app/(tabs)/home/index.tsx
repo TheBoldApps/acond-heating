@@ -3,8 +3,9 @@ import { ScrollView, View, Text, RefreshControl, Alert } from "react-native";
 import { router, Stack, useFocusEffect } from "expo-router";
 import { SymbolView } from "expo-symbols";
 import * as Haptics from "expo-haptics";
-import { AcondClient, type Config } from "@/lib/acond-client";
+import { AcondClient, AcondError, type Config } from "@/lib/acond-client";
 import { readSnapshot, type Snapshot } from "@/lib/snapshot";
+import { writeSetpoint as writeVerified } from "@/lib/controls";
 import { PAGE, V, LIMITS } from "@/lib/variables";
 import { loadConfig } from "@/lib/store";
 import { initHistory, recordSample } from "@/lib/history";
@@ -18,6 +19,7 @@ const POLL_MS = 12000;
 export default function Home() {
   const [client, setClient] = useState<AcondClient | null>(null);
   const [snap, setSnap] = useState<Snapshot | null>(null);
+  const snapRef = useRef<Snapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   // Pending setpoints show instantly (optimistic) until a fresh read confirms.
@@ -31,6 +33,9 @@ export default function Home() {
   // is dropped even if a previous write is still in flight.
   const latestWrite = useRef<{ room: number | null; dhw: number | null }>({ room: null, dhw: null });
   const draining = useRef<{ room: boolean; dhw: boolean }>({ room: false, dhw: false });
+  // Bumped on every setpoint write. A poll whose read began before a write
+  // finished carries the pre-write setpoint and must not overwrite it.
+  const writeSeq = useRef(0);
 
   useEffect(() => {
     initHistory();
@@ -45,7 +50,14 @@ export default function Home() {
       if (!client) return;
       if (!silent) setRefreshing(true);
       try {
-        const s = await readSnapshot(client);
+        const seq = writeSeq.current;
+        const read = await readSnapshot(client);
+        // Keep the setpoints just written if a write landed during this read.
+        const s =
+          seq === writeSeq.current
+            ? read
+            : { ...read, roomTarget: snapRef.current?.roomTarget ?? read.roomTarget, dhwTarget: snapRef.current?.dhwTarget ?? read.dhwTarget };
+        snapRef.current = s;
         setSnap(s);
         setError(null);
         setLastOk(Date.now());
@@ -100,16 +112,26 @@ export default function Home() {
       while (latestWrite.current[kind] != null) {
         const v = latestWrite.current[kind]!;
         latestWrite.current[kind] = null;
-        await client.writeVar(varName, v.toFixed(1), page);
+        writeSeq.current += 1;
+        // Written and read back from the controller; throws if it disagrees.
+        const confirmed = await writeVerified(client, varName, v, page);
+        if (latestWrite.current[kind] == null && snapRef.current) {
+          const key = kind === "room" ? "roomTarget" : "dhwTarget";
+          snapRef.current = { ...snapRef.current, [key]: confirmed };
+          setSnap(snapRef.current);
+          setPending(null);
+        }
       }
-      setTimeout(() => refresh(true), 600); // confirm from the device
-    } catch {
+    } catch (e) {
       if (process.env.EXPO_OS === "ios") {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
       }
       latestWrite.current[kind] = null;
       setPending(null);
-      Alert.alert("Nepovedlo se", "Změnu se nepodařilo uložit. Zkuste to prosím znovu.");
+      const detail =
+        e instanceof AcondError && e.message.startsWith("Regulátor") ? `${e.message} ` : "";
+      Alert.alert("Nepovedlo se", `${detail}Změnu se nepodařilo uložit. Zkuste to prosím znovu.`);
+      refresh(true); // show what the controller really holds
     } finally {
       draining.current[kind] = false;
     }
@@ -157,7 +179,14 @@ export default function Home() {
               title="Teplota v domě"
               detail={fmt(snap?.roomTemp, "°C teď")}
             />
-            {snap?.summer ? (
+            {snap && !snap.heatingOn ? (
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 8 }}>
+                <SymbolView name="power" tintColor={ink.red} size={22} weight="semibold" />
+                <Text style={{ flex: 1, fontSize: 15, color: colors.secondaryLabel }}>
+                  Topný systém je vypnutý (VYP). Zapni ho v Nastavení.
+                </Text>
+              </View>
+            ) : snap?.summer ? (
               <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 8 }}>
                 <SymbolView name="sun.max.fill" tintColor={ink.yellow} size={22} weight="semibold" />
                 <Text style={{ flex: 1, fontSize: 15, color: colors.secondaryLabel }}>
@@ -165,13 +194,21 @@ export default function Home() {
                 </Text>
               </View>
             ) : roomTarget != null ? (
-              <Stepper
-                value={roomTarget}
-                unit="cílová teplota"
-                {...LIMITS.room}
-                busy={roomPending != null}
-                onChange={(v) => writeSetpoint("room", v, V.roomTarget, PAGE.MAIN)}
-              />
+              <View style={{ gap: 12 }}>
+                <Stepper
+                  value={roomTarget}
+                  unit="cílová teplota"
+                  {...LIMITS.room}
+                  busy={roomPending != null}
+                  onChange={(v) => writeSetpoint("room", v, V.roomTarget, PAGE.MAIN)}
+                />
+                {snap?.regulation === "STANDARD" && (
+                  <Text style={{ fontSize: 13, lineHeight: 18, color: colors.secondaryLabel }}>
+                    Regulace je nastavená na STANDARD: vytápění řídí teplota zpátečky, ne teplota v
+                    místnosti. Změna cílové teploty se uloží, ale na topení se neprojeví.
+                  </Text>
+                )}
+              </View>
             ) : (
               <Skeleton />
             )}
@@ -313,6 +350,7 @@ function powerCaption(s: Snapshot | null): string {
   if (s.heatOutputKw != null && s.heatOutputKw > 0) return "Aktuální výkon";
   if (s.defrost) return "Odmrazování";
   if (s.dhwActive) return "Ohřívá vodu";
+  if (!s.heatingOn) return "Topný systém vypnutý";
   if (s.summer) return "Klid — letní režim";
   if (!s.compressor) return "Čerpadlo neběží";
   return "V klidu";
@@ -371,6 +409,7 @@ function describeActivity(s: Snapshot | null): { icon: string; tint: string; tex
   if (s.defrost) return { icon: "snowflake", tint: ink.teal, text: "Odmrazování" };
   if (s.dhwActive) return { icon: "drop.fill", tint: ink.blue, text: "Ohřívá teplou vodu" };
   if (s.compressor) return { icon: "flame.fill", tint: ink.orange, text: "Topí" };
+  if (!s.heatingOn) return { icon: "power", tint: ink.red, text: "Topný systém vypnutý" };
   return {
     icon: s.summer ? "sun.max.fill" : "leaf.fill",
     tint: s.summer ? (ink.yellow) : (ink.green),

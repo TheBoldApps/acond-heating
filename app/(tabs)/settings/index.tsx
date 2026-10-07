@@ -5,7 +5,9 @@ import { router, useFocusEffect } from "expo-router";
 import * as Haptics from "expo-haptics";
 import { colors, ink } from "@/theme/colors";
 import { loadConfig, clearConfig } from "@/lib/store";
-import { AcondClient, type Config } from "@/lib/acond-client";
+import { AcondClient, AcondError, type Config } from "@/lib/acond-client";
+import { setHeatingOn, setSeason } from "@/lib/controls";
+import { REGULATION_LABEL } from "@/lib/snapshot";
 import { PAGE, V } from "@/lib/variables";
 import { loadThemePref, saveThemePref, applyThemePref, type ThemePref } from "@/lib/theme-preference";
 
@@ -134,6 +136,10 @@ export default function SettingsScreen() {
   const [config, setConfig] = useState<Config | null>(null);
   const [client, setClient] = useState<AcondClient | null>(null);
   const [summer, setSummer] = useState<boolean | null>(null);
+  const [heatingOn, setHeatingOnState] = useState<boolean | null>(null);
+  const [regulation, setRegulation] = useState<string | null>(null);
+  const [seasonEnd, setSeasonEnd] = useState<number | null>(null);
+  const [outdoorAvg, setOutdoorAvg] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [theme, setTheme] = useState<ThemePref>("auto");
@@ -161,6 +167,10 @@ export default function SettingsScreen() {
       try {
         const map = await client.readPage(PAGE.MAIN);
         setSummer(AcondClient.bool(map, V.summerMode));
+        setHeatingOnState(!AcondClient.bool(map, V.modeOff));
+        setRegulation((map[V.regulationType] ?? "").trim().toUpperCase() || null);
+        setSeasonEnd(AcondClient.num(map, V.seasonEnd));
+        setOutdoorAvg(AcondClient.num(map, V.outdoorAvg));
       } catch {
         // leave the last known value; pull-to-refresh can retry
       } finally {
@@ -176,40 +186,81 @@ export default function SettingsScreen() {
     }, [loadSeason])
   );
 
+  function haptic(ok: boolean) {
+    if (process.env.EXPO_OS !== "ios") return;
+    Haptics.notificationAsync(
+      ok ? Haptics.NotificationFeedbackType.Success : Haptics.NotificationFeedbackType.Error
+    );
+  }
+
+  /** Run a confirmed control, then re-read the real state from the controller. */
+  async function runControl(action: () => Promise<void>, failText: string) {
+    setBusy(true);
+    try {
+      await action();
+      haptic(true);
+    } catch (e) {
+      haptic(false);
+      const detail = e instanceof AcondError && e.message.startsWith("Regulátor") ? `${e.message} ` : "";
+      Alert.alert("Nepovedlo se", `${detail}${failText}`);
+    } finally {
+      setBusy(false);
+      loadSeason(true);
+    }
+  }
+
   // Season controls whole-house heating, so confirm before writing.
   function onToggleSeason() {
     if (!client || busy || summer == null) return;
-    const goingToWinter = summer; // currently summer → switching to winter
+    const toSummer = !summer;
+    const avg = outdoorAvg != null ? `${outdoorAvg.toFixed(1)} °C` : "aktuální průměr";
+    const newEnd =
+      outdoorAvg != null ? `${(outdoorAvg + (toSummer ? -3 : 3)).toFixed(1)} °C` : "průměr ± 3 °C";
     Alert.alert(
-      goingToWinter ? "Zapnout topení (zimní režim)?" : "Vypnout topení (letní režim)?",
-      goingToWinter
-        ? "Přepnutím na zimní režim se spustí vytápění domu."
-        : "V letním režimu se vytápění domu zastaví. Ohřev teplé vody zůstává.",
+      toSummer ? "Přepnout na letní provoz?" : "Přepnout na zimní provoz?",
+      (toSummer
+        ? "Vytápění domu se vypne. Ohřev teplé vody běží dál."
+        : "Vytápění domu se zapne. Ohřev teplé vody běží dál.") +
+        `\n\nRegulátor jinak přepíná sám podle průměrné venkovní teploty (${avg}). ` +
+        `Ruční přepnutí nastaví „Konec topné sezóny“ ` +
+        (seasonEnd != null ? `z ${seasonEnd.toFixed(1)} °C ` : "") +
+        `na ${newEnd}.`,
       [
         { text: "Zrušit", style: "cancel" },
         {
           text: "Přepnout",
-          style: goingToWinter ? "default" : "destructive",
-          onPress: async () => {
-            setBusy(true);
-            const optimistic = !summer;
-            setSummer(optimistic);
-            try {
-              await client.toggleVar(V.summerMode, PAGE.MAIN);
-              if (process.env.EXPO_OS === "ios") {
-                Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-              }
-              setTimeout(() => loadSeason(true), 700);
-            } catch {
-              setSummer(!optimistic); // revert
-              if (process.env.EXPO_OS === "ios") {
-                Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-              }
-              Alert.alert("Nepovedlo se", "Režim se nepodařilo přepnout. Zkuste to znovu.");
-            } finally {
-              setBusy(false);
-            }
-          },
+          style: toSummer ? "destructive" : "default",
+          onPress: () =>
+            runControl(
+              () => setSeason(client, toSummer),
+              "Provoz se nepodařilo přepnout. Zkuste to prosím znovu."
+            ),
+        },
+      ]
+    );
+  }
+
+  // On = AUT (automatika), off = VYP (topný systém vypnut).
+  function onToggleHeating() {
+    if (!client || busy || heatingOn == null) return;
+    const turnOn = !heatingOn;
+    Alert.alert(
+      turnOn ? "Zapnout topný systém?" : "Vypnout topný systém?",
+      turnOn
+        ? "Tepelné čerpadlo přejde do režimu Automatika (AUT) – topí podle potřeby, v případě potřeby i s bivalencí."
+        : "Tepelné čerpadlo přejde do režimu VYP – topný systém se vypne a dům se přestane vytápět. Zda pokračuje ohřev teplé vody, zatím není ověřeno.",
+      [
+        { text: "Zrušit", style: "cancel" },
+        {
+          text: turnOn ? "Zapnout" : "Vypnout",
+          style: turnOn ? "default" : "destructive",
+          onPress: () =>
+            runControl(
+              () => setHeatingOn(client, turnOn),
+              turnOn
+                ? "Topný systém se nepodařilo zapnout. Zkuste to prosím znovu."
+                : "Topný systém se nepodařilo vypnout. Zkuste to prosím znovu."
+            ),
         },
       ]
     );
@@ -250,19 +301,50 @@ export default function SettingsScreen() {
             }}
           >
             <SymbolView
+              name="power"
+              tintColor={heatingOn === false ? ink.red : ink.green}
+              size={22}
+              weight="semibold"
+            />
+            <View style={{ flex: 1 }}>
+              <Text style={{ color: colors.label, fontSize: 16 }}>Topný systém</Text>
+              <Text style={{ color: colors.secondaryLabel, fontSize: 13, marginTop: 2 }}>
+                {heatingOn == null
+                  ? "Načítání…"
+                  : heatingOn
+                    ? "Zapnuto – režim Automatika (AUT)"
+                    : "Vypnuto – režim VYP"}
+              </Text>
+            </View>
+            <Switch
+              value={heatingOn ?? false}
+              onValueChange={onToggleHeating}
+              disabled={busy || heatingOn == null || client == null}
+            />
+          </View>
+          <View
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              paddingHorizontal: 16,
+              paddingVertical: 12,
+              gap: 12,
+            }}
+          >
+            <SymbolView
               name={summer ? "sun.max.fill" : "snowflake"}
               tintColor={summer ? ink.yellow : ink.teal}
               size={22}
               weight="semibold"
             />
             <View style={{ flex: 1 }}>
-              <Text style={{ color: colors.label, fontSize: 16 }}>Letní režim</Text>
+              <Text style={{ color: colors.label, fontSize: 16 }}>Letní provoz</Text>
               <Text style={{ color: colors.secondaryLabel, fontSize: 13, marginTop: 2 }}>
                 {summer == null
                   ? "Načítání…"
                   : summer
-                    ? "Topení vypnuté, jen teplá voda"
-                    : "Zimní režim — topení zapnuté"}
+                    ? "Léto – vytápění vypnuto, teplá voda běží"
+                    : "Zima – vytápění zapnuto"}
               </Text>
             </View>
             <Switch
@@ -271,7 +353,28 @@ export default function SettingsScreen() {
               disabled={busy || summer == null || client == null}
             />
           </View>
+          <Row
+            icon="thermometer.sun"
+            label="Konec topné sezóny"
+            value={seasonEnd != null ? `${seasonEnd.toFixed(1)} °C` : "—"}
+          />
+          <InfoRow
+            icon="slider.horizontal.3"
+            label={`Typ regulace: ${regulation ?? "—"}`}
+            subtitle={
+              regulation === "STANDARD"
+                ? "Ruční teplota zpátečky – vytápění řídí teplota zpátečky, cílová teplota v místnosti se na topení neprojeví."
+                : regulation && regulation in REGULATION_LABEL
+                  ? `Regulace ${REGULATION_LABEL[regulation as keyof typeof REGULATION_LABEL]}.`
+                  : "Načítání…"
+            }
+          />
         </Card>
+        <Text style={{ color: colors.secondaryLabel, fontSize: 13, lineHeight: 18, marginTop: 8, marginHorizontal: 16 }}>
+          Léto / zima přepíná regulátor sám: když dlouhodobý průměr venkovní teploty
+          překročí „Konec topné sezóny“, přejde do léta, a když pod něj klesne, vrátí se
+          do zimy.
+        </Text>
       </View>
 
       {/* Appearance */}
